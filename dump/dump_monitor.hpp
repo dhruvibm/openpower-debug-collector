@@ -3,18 +3,21 @@
 #include "dump_utils.hpp"
 #include "sbe_consts.hpp"
 
-#include <sys/wait.h>
-#include <unistd.h>
+#include <systemd/sd-event.h>
 
-#include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/bus.hpp>
 #include <sdbusplus/bus/match.hpp>
 #include <xyz/openbmc_project/Common/Progress/common.hpp>
 #include <xyz/openbmc_project/Dump/Entry/System/common.hpp>
 
-#include <iostream>
+#include <cstdint>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace openpower::dump
 {
@@ -31,28 +34,37 @@ class DumpMonitor
   public:
     /**
      * @brief Constructor for DumpMonitor.
-     * Initializes the DBus connection and signal match for monitoring dump
-     * creation.
+     * Initializes the event loop, DBus signal match, and system dump directory
+     * watch.
      */
-    DumpMonitor() :
-        bus(sdbusplus::bus::new_default()),
-        match(bus,
-              sdbusplus::bus::match::rules::interfacesAdded(
-                  "/xyz/openbmc_project/dump") +
-                  sdbusplus::bus::match::rules::sender(
-                      "xyz.openbmc_project.Dump.Manager"),
-              [this](sdbusplus::message_t& msg) { handleDBusSignal(msg); })
-    {}
+    DumpMonitor();
+
+    ~DumpMonitor();
+
+    DumpMonitor(const DumpMonitor&) = delete;
+    DumpMonitor& operator=(const DumpMonitor&) = delete;
+    DumpMonitor(DumpMonitor&&) = delete;
+    DumpMonitor& operator=(DumpMonitor&&) = delete;
 
     /**
-     * @brief Runs the monitor to continuously listen for DBus signals.
+     * @brief Runs the monitor to listen for DBus and filesystem events.
+     *
+     * @return The event loop return code.
      */
-    void run()
-    {
-        bus.process_loop();
-    }
+    int run();
 
   private:
+    struct EventDeleter
+    {
+        void operator()(sd_event* event) const noexcept
+        {
+            sd_event_unref(event);
+        }
+    };
+
+    /* @brief Event loop shared by DBus and inotify */
+    std::unique_ptr<sd_event, EventDeleter> event;
+
     /* @brief sdbusplus handler for a bus to use */
     sdbusplus::bus_t bus;
 
@@ -64,11 +76,49 @@ class DumpMonitor
     /* @brief InterfaceAdded match */
     sdbusplus::bus::match_t match;
 
+    /* @brief File descriptor for the inotify instance */
+    int inotifyFd = -1;
+
+    /* @brief Watch descriptor for the temporary system dump directory */
+    int inotifyWatchDescriptor = -1;
+
+    /* @brief Event source used to dispatch inotify events */
+    sd_event_source* inotifyEventSource = nullptr;
+
     /**
      * @brief Handles the received DBus signal for dump creation.
      * @param[in] msg - The DBus message received.
      */
     void handleDBusSignal(sdbusplus::message_t& msg);
+
+    /**
+     * @brief Adds the temporary system dump directory to the event loop.
+     */
+    void setupInotifyWatch();
+
+    /**
+     * @brief Handles readiness notifications for the inotify descriptor.
+     *
+     * @return Zero so the event source remains enabled.
+     */
+    static int inotifyCallback(sd_event_source* source, int fd,
+                               uint32_t revents, void* userdata);
+
+    /**
+     * @brief Correlates a new dump file with an in-progress system dump entry.
+     * @param[in] filePath - Path reported by inotify.
+     */
+    void handleSystemDumpFile(const std::filesystem::path& filePath);
+
+    /**
+     * @brief Finds an in-progress system dump entry.
+     *
+     * If multiple entries are in progress, logs an error and returns the first
+     * entry in lexical object-path order so that the dump is not discarded.
+     *
+     * @return The selected entry, or std::nullopt if no entry is in progress.
+     */
+    std::optional<std::string> findInProgressSystemDump();
 
     /**
      * @brief Checks if the dump creation is in progress.

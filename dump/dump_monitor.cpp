@@ -2,9 +2,21 @@
 
 #include "dump_utils.hpp"
 
+#include <sys/epoll.h>
+#include <sys/inotify.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <phosphor-logging/lg2.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstddef>
+#include <exception>
+#include <filesystem>
 #include <regex>
+#include <system_error>
 
 namespace openpower::dump
 {
@@ -12,6 +24,281 @@ namespace openpower::dump
 constexpr auto dumpOutPath = "/var/lib/phosphor-debug-collector/opdump";
 constexpr auto dumpStatusFailed =
     "xyz.openbmc_project.Common.Progress.OperationStatus.Failed";
+// This path must match PLDM's system dump transfer destination.
+constexpr auto TEMPORARY_SYSTEM_DUMP_FOLDER =
+    "/var/lib/phosphor-debug-collector/tmp";
+constexpr auto dumpManagerService = "xyz.openbmc_project.Dump.Manager";
+constexpr auto dumpEntryRoot = "/xyz/openbmc_project/dump/system/entry";
+constexpr auto objectMapperService = "xyz.openbmc_project.ObjectMapper";
+constexpr auto objectMapperPath = "/xyz/openbmc_project/object_mapper";
+constexpr auto objectMapperInterface = "xyz.openbmc_project.ObjectMapper";
+constexpr auto propertiesInterface = "org.freedesktop.DBus.Properties";
+// This event only means that the writer closed the file. It does not prove
+// that the transfer completed successfully.
+constexpr uint32_t newSystemDumpEvents = IN_CLOSE_WRITE;
+
+DumpMonitor::DumpMonitor() :
+    event(nullptr), bus(sdbusplus::bus::new_default()),
+    match(bus,
+          sdbusplus::bus::match::rules::interfacesAdded(
+              "/xyz/openbmc_project/dump") +
+              sdbusplus::bus::match::rules::sender(dumpManagerService),
+          [this](sdbusplus::message_t& msg) { handleDBusSignal(msg); })
+{
+    sd_event* eventPtr = nullptr;
+    auto rc = sd_event_default(&eventPtr);
+    if (rc < 0)
+    {
+        lg2::error("Failed to create event loop, rc: {RC}", "RC", rc);
+        throw std::system_error(-rc, std::generic_category(),
+                                "Failed to create event loop");
+    }
+    event.reset(eventPtr);
+
+    bus.attach_event(event.get(), SD_EVENT_PRIORITY_NORMAL);
+    setupInotifyWatch();
+}
+
+DumpMonitor::~DumpMonitor()
+{
+    if (inotifyEventSource != nullptr)
+    {
+        sd_event_source_unref(inotifyEventSource);
+    }
+
+    if (inotifyWatchDescriptor >= 0)
+    {
+        inotify_rm_watch(inotifyFd, inotifyWatchDescriptor);
+    }
+
+    if (inotifyFd >= 0)
+    {
+        close(inotifyFd);
+    }
+}
+
+int DumpMonitor::run()
+{
+    return sd_event_loop(event.get());
+}
+
+void DumpMonitor::setupInotifyWatch()
+{
+    std::error_code ec;
+    std::filesystem::create_directories(TEMPORARY_SYSTEM_DUMP_FOLDER, ec);
+    if (ec)
+    {
+        lg2::error("Failed to create system dump watch directory {PATH}: "
+                   "{ERROR}",
+                   "PATH", TEMPORARY_SYSTEM_DUMP_FOLDER, "ERROR", ec.message());
+        throw std::system_error(ec, "Failed to create system dump directory");
+    }
+
+    inotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotifyFd < 0)
+    {
+        auto error = errno;
+        lg2::error("Failed to initialize inotify, errno: {ERRNO}", "ERRNO",
+                   error);
+        throw std::system_error(error, std::generic_category(),
+                                "Failed to initialize inotify");
+    }
+
+    inotifyWatchDescriptor = inotify_add_watch(
+        inotifyFd, TEMPORARY_SYSTEM_DUMP_FOLDER, newSystemDumpEvents);
+    if (inotifyWatchDescriptor < 0)
+    {
+        auto error = errno;
+        close(inotifyFd);
+        inotifyFd = -1;
+        lg2::error("Failed to watch system dump directory {PATH}, errno: "
+                   "{ERRNO}",
+                   "PATH", TEMPORARY_SYSTEM_DUMP_FOLDER, "ERRNO", error);
+        throw std::system_error(error, std::generic_category(),
+                                "Failed to add inotify watch");
+    }
+
+    auto rc = sd_event_add_io(event.get(), &inotifyEventSource, inotifyFd,
+                              EPOLLIN, inotifyCallback, this);
+    if (rc < 0)
+    {
+        auto error = -rc;
+        inotify_rm_watch(inotifyFd, inotifyWatchDescriptor);
+        inotifyWatchDescriptor = -1;
+        close(inotifyFd);
+        inotifyFd = -1;
+        lg2::error("Failed to add inotify descriptor to event loop, rc: {RC}",
+                   "RC", rc);
+        throw std::system_error(error, std::generic_category(),
+                                "Failed to add inotify event source");
+    }
+}
+
+int DumpMonitor::inotifyCallback(sd_event_source*, int fd, uint32_t revents,
+                                 void* userdata)
+{
+    if ((revents & EPOLLIN) == 0U)
+    {
+        lg2::error("Unexpected inotify event flags {EVENTS}", "EVENTS",
+                   revents);
+        return 0;
+    }
+
+    auto monitor = static_cast<DumpMonitor*>(userdata);
+    alignas(inotify_event) std::array<char, 4096> buffer{};
+
+    while (true)
+    {
+        auto bytesRead = read(fd, buffer.data(), buffer.size());
+        if (bytesRead < 0)
+        {
+            auto error = errno;
+            if (error == EINTR)
+            {
+                continue;
+            }
+            if (error != EAGAIN && error != EWOULDBLOCK)
+            {
+                lg2::error("Failed to read inotify events, errno: {ERRNO}",
+                           "ERRNO", error);
+            }
+            break;
+        }
+        if (bytesRead == 0)
+        {
+            break;
+        }
+
+        size_t offset = 0;
+        const auto bytesAvailable = static_cast<size_t>(bytesRead);
+        while (offset + sizeof(inotify_event) <= bytesAvailable)
+        {
+            auto inotifyEvent = reinterpret_cast<const struct inotify_event*>(
+                buffer.data() + offset);
+            const auto eventSize = sizeof(inotify_event) + inotifyEvent->len;
+            if (offset + eventSize > bytesAvailable)
+            {
+                lg2::error("Received a truncated inotify event");
+                break;
+            }
+
+            if ((inotifyEvent->mask & IN_Q_OVERFLOW) != 0U)
+            {
+                lg2::error("System dump inotify queue overflowed");
+            }
+            else if (inotifyEvent->len > 0 &&
+                     (inotifyEvent->mask & IN_ISDIR) == 0U &&
+                     (inotifyEvent->mask & newSystemDumpEvents) != 0U)
+            {
+                try
+                {
+                    monitor->handleSystemDumpFile(
+                        std::filesystem::path(TEMPORARY_SYSTEM_DUMP_FOLDER) /
+                        inotifyEvent->name);
+                }
+                catch (const std::exception& e)
+                {
+                    // Never allow an exception to cross the C callback.
+                    lg2::error("Failed to handle inotify event: {ERROR}",
+                               "ERROR", e);
+                }
+            }
+
+            offset += eventSize;
+        }
+    }
+
+    return 0;
+}
+
+void DumpMonitor::handleSystemDumpFile(const std::filesystem::path& filePath)
+{
+    try
+    {
+        auto dumpEntry = findInProgressSystemDump();
+        if (!dumpEntry)
+        {
+            lg2::error(
+                "No in-progress system dump entry found for new file {FILE}",
+                "FILE", filePath);
+            return;
+        }
+
+        // Collection and relocation will be added after the event flow is
+        // proven. For now, record the file and the entry selected for it.
+        lg2::info("System dump file writer closed {FILE}; found in-progress "
+                  "entry {ENTRY}. Completion is unverified",
+                  "FILE", filePath, "ENTRY", *dumpEntry);
+    }
+    catch (const std::exception& e)
+    {
+        // Do not allow an exception to cross the C sd-event callback boundary.
+        lg2::error("Failed to find an in-progress entry for system dump file "
+                   "{FILE}: {ERROR}",
+                   "FILE", filePath, "ERROR", e);
+    }
+}
+
+std::optional<std::string> DumpMonitor::findInProgressSystemDump()
+{
+    using namespace sdbusplus::common::xyz::openbmc_project::common;
+    using namespace sdbusplus::common::xyz::openbmc_project::dump::entry;
+
+    auto mapperCall =
+        bus.new_method_call(objectMapperService, objectMapperPath,
+                            objectMapperInterface, "GetSubTreePaths");
+    mapperCall.append(dumpEntryRoot, 0,
+                      std::vector<std::string>{System::interface});
+
+    std::vector<std::string> systemDumpEntries;
+    auto mapperReply = bus.call(mapperCall);
+    mapperReply.read(systemDumpEntries);
+    std::sort(systemDumpEntries.begin(), systemDumpEntries.end());
+
+    const auto inProgressStatus = Progress::convertOperationStatusToString(
+        Progress::OperationStatus::InProgress);
+    std::vector<std::string> inProgressEntries;
+
+    for (const auto& entry : systemDumpEntries)
+    {
+        try
+        {
+            auto propertyCall = bus.new_method_call(
+                dumpManagerService, entry.c_str(), propertiesInterface, "Get");
+            propertyCall.append(Progress::interface, "Status");
+
+            std::variant<std::string> status;
+            auto propertyReply = bus.call(propertyCall);
+            propertyReply.read(status);
+            if (std::get<std::string>(status) == inProgressStatus)
+            {
+                inProgressEntries.push_back(entry);
+            }
+        }
+        catch (const std::exception& e)
+        {
+            // An entry can disappear between the mapper and property calls.
+            // Keep looking so another valid in-progress dump is not lost.
+            lg2::error("Failed to read dump progress for {ENTRY}: {ERROR}",
+                       "ENTRY", entry, "ERROR", e);
+        }
+    }
+
+    if (inProgressEntries.empty())
+    {
+        return std::nullopt;
+    }
+
+    if (inProgressEntries.size() > 1)
+    {
+        lg2::error("Found {COUNT} in-progress system dump entries; using "
+                   "{ENTRY}",
+                   "COUNT", inProgressEntries.size(), "ENTRY",
+                   inProgressEntries.front());
+    }
+
+    return inProgressEntries.front();
+}
 
 void DumpMonitor::executeCollectionScript(
     const sdbusplus::message::object_path& path, const PropertyMap& properties)

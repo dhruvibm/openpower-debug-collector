@@ -10,6 +10,5 @@
 int main()
 {
     openpower::dump::DumpMonitor monitor;
-    monitor.run();
-    return 0;
+    return monitor.run();
 }
