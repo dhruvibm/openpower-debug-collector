@@ -1,6 +1,9 @@
 #include "../dump/dump_utils.hpp"
 #include "error_iface.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/bus.hpp>
 #include <sdbusplus/message.hpp>
@@ -9,6 +12,7 @@
 
 #include <cstdlib>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -47,114 +51,124 @@ std::tuple<uint32_t, std::string> getPelInfo([[maybe_unused]] uint32_t logId)
 
 #ifdef NEXT_PHAL
 // Helper to convert errl severity to D-Bus level string
-static std::string getSeverityLevel(int severity)
+static std::string getSeverityLevel(errl::Level severity)
 {
     using Level =
         sdbusplus::xyz::openbmc_project::Logging::server::Entry::Level;
-
-    // Map severity to Level enum
-    // Severity levels from errl: 0=Emergency, 1=Alert, 2=Critical, 3=Error,
-    // etc. Map to Logging.Entry.Level
-    Level level = Level::Error; // Default
-    if (severity <= 2)
+    Level level = Level::Error;
+    switch (severity)
     {
-        level = Level::Critical;
+        case errl::Level::Emergency:
+            level = Level::Emergency;
+            break;
+        case errl::Level::Alert:
+            level = Level::Alert;
+            break;
+        case errl::Level::Critical:
+            level = Level::Critical;
+            break;
+        case errl::Level::Error:
+            level = Level::Error;
+            break;
+        case errl::Level::Warning:
+            level = Level::Warning;
+            break;
+        case errl::Level::Notice:
+            level = Level::Notice;
+            break;
+        case errl::Level::Informational:
+            level = Level::Informational;
+            break;
+        case errl::Level::Debug:
+            level = Level::Debug;
+            break;
     }
-    else if (severity == 3)
-    {
-        level = Level::Error;
-    }
-    else if (severity == 4)
-    {
-        level = Level::Warning;
-    }
-    else
-    {
-        level = Level::Informational;
-    }
-
     return sdbusplus::xyz::openbmc_project::Logging::server::convertForMessage(
         level);
 }
 
 uint32_t commitHostfwError(errl::ErrlHandleOpt&& err)
 {
-    if (!err)
+    if (!err || !err->hasEntries())
     {
         return 0;
     }
 
-    try
+    uint32_t pelId = 0;
+    for (const auto& entry : err->getEntries())
     {
-        auto bus = sdbusplus::bus::new_default();
-        constexpr auto loggingObjectPath = "/xyz/openbmc_project/logging";
-        constexpr auto opLoggingInterface = "org.open_power.Logging.PEL";
-
-        // Get entries from error handle
-        const auto& entries = err->getEntries();
-        if (entries.empty())
+        std::vector<int> openedFds;
+        try
         {
-            lg2::warning("commitHostfwError: Error handle has no entries");
-            return 0;
-        }
-
-        uint32_t pelId = 0;
-
-        // Process each entry in the error handle (typically just 1)
-        for (const auto& entry : entries)
-        {
-            // Build additional data map
-            std::map<std::string, std::string> additionalData;
-            additionalData["_PID"] = std::to_string(getpid());
-            for (const auto& [key, value] : entry->getAdditionalData())
-            {
-                additionalData[key] = value;
-            }
-
-            // Get severity level (cast errl::Level enum to int)
-            auto level =
-                getSeverityLevel(static_cast<int>(entry->getSeverity()));
-
-            // Get service via D-Bus introspection
-            auto service = openpower::dump::util::getService(
-                bus, opLoggingInterface, loggingObjectPath);
-
-            // Prepare D-Bus call to CreatePELWithFFDCFiles (no files for hostfw
-            // errors)
-            auto method = bus.new_method_call(
-                service.c_str(), loggingObjectPath, opLoggingInterface,
-                "CreatePELWithFFDCFiles");
-
-            // Empty FFDC file list (tuple format: FFDCFormat enum, subtype,
-            // version, fd)
+            auto bus = sdbusplus::bus::new_default();
+            constexpr auto path = "/xyz/openbmc_project/logging";
+            constexpr auto interface = "org.open_power.Logging.PEL";
+            std::map<std::string, std::string> data(
+                entry->getAdditionalData().begin(),
+                entry->getAdditionalData().end());
+            data["_PID"] = std::to_string(getpid());
             std::vector<std::tuple<DBusFFDCFormat, uint8_t, uint8_t,
                                    sdbusplus::message::unix_fd>>
                 files;
-
-            // Append parameters: message, level, additionalData, files
-            method.append(entry->getMessage(), level, additionalData, files);
-
-            // Call D-Bus method and get response
+            if (const auto& attachments = entry->getFfdcFiles(); attachments)
+            {
+                for (const auto& [attachment, filePath] : *attachments)
+                {
+                    const int fd =
+                        ::open(filePath.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd < 0)
+                    {
+                        throw std::runtime_error(
+                            "Cannot open HostFW FFDC: " + filePath.string());
+                    }
+                    openedFds.push_back(fd);
+                    DBusFFDCFormat format = DBusFFDCFormat::Custom;
+                    switch (attachment.format)
+                    {
+                        case errl::FFDCFormat::JSON:
+                            format = DBusFFDCFormat::JSON;
+                            break;
+                        case errl::FFDCFormat::CBOR:
+                            format = DBusFFDCFormat::CBOR;
+                            break;
+                        case errl::FFDCFormat::Text:
+                            format = DBusFFDCFormat::Text;
+                            break;
+                        case errl::FFDCFormat::Custom:
+                            break;
+                    }
+                    files.emplace_back(format, attachment.subType,
+                                       attachment.version,
+                                       sdbusplus::message::unix_fd{fd});
+                }
+            }
+            const auto service =
+                openpower::dump::util::getService(bus, interface, path);
+            auto method = bus.new_method_call(service.c_str(), path, interface,
+                                              "CreatePELWithFFDCFiles");
+            method.append(entry->getMessage(),
+                          getSeverityLevel(entry->getSeverity()), data, files);
             auto reply = bus.call(method);
-            // Reply is a struct[uint32, uint32] containing (logId, pelId)
-            std::tuple<uint32_t, uint32_t> ids{0, 0};
+            std::tuple<uint32_t, uint32_t> ids{};
             reply.read(ids);
-            uint32_t logId = std::get<0>(ids);
-            pelId = std::get<1>(ids);
-
-            lg2::info("commitHostfwError: Created PEL from hostfw error, "
-                      "logId={LOG_ID}, pelId={PEL_ID}",
-                      "LOG_ID", logId, "PEL_ID", pelId);
+            const auto createdId = std::get<1>(ids);
+            if (createdId == 0)
+            {
+                throw std::runtime_error("PEL service returned a zero PEL ID");
+            }
+            pelId = createdId;
         }
-
-        return pelId;
+        catch (const std::exception& e)
+        {
+            lg2::error("Failed to publish HostFW entry {ENTRY}: {ERROR}",
+                       "ENTRY", entry->getMessage(), "ERROR", e.what());
+        }
+        for (const int fd : openedFds)
+        {
+            ::close(fd);
+        }
     }
-    catch (const std::exception& e)
-    {
-        lg2::error("commitHostfwError: Failed to create PEL: {EXCEPTION}",
-                   "EXCEPTION", e.what());
-        return 0;
-    }
+    return pelId;
 }
 #endif // NEXT_PHAL
 

@@ -169,10 +169,15 @@ void SbeDumpCollector::collectTriggeredSBEDump(
         // created (plat_dump directory) so opdreport can find and package them
         auto err =
             hostfw::dump::recoverSppeAndCollectDump(id, failingUnit, path);
-        if (err)
+        const bool failed = errl::hasTerminalErrors(err);
+        uint32_t pelId = 0;
+        if (err && err->hasEntries())
+        {
+            pelId = phal_err::commitHostfwError(std::move(err));
+        }
+        if (failed)
         {
             // Commit the error as a PEL before throwing
-            uint32_t pelId = phal_err::commitHostfwError(std::move(err));
             lg2::error(
                 "collectTriggeredSBEDump: Timeout recovery failed for unit "
                 "{UNIT}, PEL ID: {PEL}",
@@ -212,9 +217,14 @@ void SbeDumpCollector::collectTriggeredSBEDump(
         // Downstream: SPPE is alive — no hreset needed.
         // The EID was provided by the caller via ErrorLogId on the busctl call.
         auto err = hostfw::dump::collectDownstreamSBEDump(failingUnit, path);
-        if (err)
+        const bool failed = errl::hasTerminalErrors(err);
+        uint32_t pelId = 0;
+        if (err && err->hasEntries())
         {
-            uint32_t pelId = phal_err::commitHostfwError(std::move(err));
+            pelId = phal_err::commitHostfwError(std::move(err));
+        }
+        if (failed)
+        {
             lg2::error(
                 "collectTriggeredSBEDump: Downstream collection failed for "
                 "unit {UNIT}, PEL ID: {PEL}",

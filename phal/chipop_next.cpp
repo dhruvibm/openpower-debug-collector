@@ -1,4 +1,5 @@
 #include "chipop_iface.hpp"
+#include "error_iface.hpp"
 
 #include <dump.H>
 
@@ -66,10 +67,15 @@ DumpData getDump(targeting::TargetHandle chip, uint8_t dumpType,
     auto errl = hostfw::dump::getDump(chip, dumpType, clockState,
                                       collectFastArray, dumpData);
 
-    // Check if error occurred (errl will have a value if there was an error)
-    if (errl)
+    // Publish every entry; terminal classification determines chip-op failure.
+    const bool failed = errl::hasTerminalErrors(errl);
+    if (errl && errl->hasEntries())
     {
-        // Error log was created internally by hostfw::dump::getDump
+        error::commitHostfwError(std::move(errl));
+    }
+    if (failed)
+    {
+        // The PHAL operation failed independently of diagnostic severity.
         throw ChipOpError(ChipOpError::Type::Failed,
                           "getDump failed - error log created");
     }
