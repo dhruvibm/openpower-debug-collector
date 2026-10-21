@@ -1,5 +1,9 @@
 #include "../dump/dump_utils.hpp"
 #include "error_iface.hpp"
+#include "hostfw_error_publish.hpp"
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/bus.hpp>
@@ -9,6 +13,8 @@
 
 #include <cstdlib>
 #include <map>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -77,84 +83,122 @@ static std::string getSeverityLevel(int severity)
         level);
 }
 
+namespace
+{
+struct OpenedFfdcFiles
+{
+    std::vector<int> descriptors;
+    ~OpenedFfdcFiles()
+    {
+        for (const int fd : descriptors)
+        {
+            ::close(fd);
+        }
+    }
+};
+
+using FfdcFiles = std::vector<std::tuple<
+    DBusFFDCFormat, uint8_t, uint8_t, sdbusplus::message::unix_fd>>;
+
+void appendFfdcFiles(const errl::ErrlEntry& entry, FfdcFiles& files,
+                     OpenedFfdcFiles& opened, bool omitCallouts = false)
+{
+    if (const auto& attachments = entry.getFfdcFiles(); attachments)
+    {
+        for (const auto& [attachment, path] : *attachments)
+        {
+            if (omitCallouts && attachment.format == errl::FFDCFormat::JSON &&
+                attachment.subType == 0xCA)
+            {
+                continue;
+            }
+            int fd = attachment.fd;
+            if (fd < 0)
+            {
+                fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd < 0)
+                {
+                    throw std::runtime_error("Cannot open HostFW FFDC: " + path.string());
+                }
+                opened.descriptors.push_back(fd);
+            }
+            DBusFFDCFormat format = DBusFFDCFormat::Custom;
+            switch (attachment.format)
+            {
+                case errl::FFDCFormat::JSON:
+                    format = DBusFFDCFormat::JSON;
+                    break;
+                case errl::FFDCFormat::CBOR:
+                    format = DBusFFDCFormat::CBOR;
+                    break;
+                case errl::FFDCFormat::Text:
+                    format = DBusFFDCFormat::Text;
+                    break;
+                case errl::FFDCFormat::Custom:
+                    break;
+            }
+            files.emplace_back(format, attachment.subType, attachment.version,
+                               sdbusplus::message::unix_fd{fd});
+        }
+    }
+}
+} // namespace
+
 uint32_t commitHostfwError(errl::ErrlHandleOpt&& err)
 {
-    if (!err)
+    if (!err || !err->hasEntries())
     {
         return 0;
     }
+    return publishHostfwEntries(
+        *err,
+        [](const errl::ErrlEntry& entry, bool terminal) {
+            auto bus = sdbusplus::bus::new_default();
+            constexpr auto path = "/xyz/openbmc_project/logging";
+            constexpr auto interface = "org.open_power.Logging.PEL";
+            std::map<std::string, std::string> data(
+                entry.getAdditionalData().begin(), entry.getAdditionalData().end());
+            data["_PID"] = std::to_string(getpid());
 
-    try
-    {
-        auto bus = sdbusplus::bus::new_default();
-        constexpr auto loggingObjectPath = "/xyz/openbmc_project/logging";
-        constexpr auto opLoggingInterface = "org.open_power.Logging.PEL";
-
-        // Get entries from error handle
-        const auto& entries = err->getEntries();
-        if (entries.empty())
-        {
-            lg2::warning("commitHostfwError: Error handle has no entries");
-            return 0;
-        }
-
-        uint32_t pelId = 0;
-
-        // Process each entry in the error handle (typically just 1)
-        for (const auto& entry : entries)
-        {
-            // Build additional data map
-            std::map<std::string, std::string> additionalData;
-            additionalData["_PID"] = std::to_string(getpid());
-            for (const auto& [key, value] : entry->getAdditionalData())
+            // Terminal callouts retain their supplied policy. Observations
+            // preserve service information without introducing target actions.
+            std::unique_ptr<errl::ErrlEntry> reportingCallouts;
+            if (!terminal && entry.getCallout())
             {
-                additionalData[key] = value;
+                data["PHAL_CALLOUT_ACTIONS_SUPPRESSED"] = "true";
+                data["PHAL_ORIGINAL_CALLOUTS"] = entry.getCallout()->dump();
+                reportingCallouts = std::make_unique<errl::ErrlEntry>(
+                    entry.getMessage(), entry.getSeverity(),
+                    std::unordered_map<std::string, std::string>{},
+                    reportOnlyCallouts(*entry.getCallout()), std::nullopt);
+                if (!reportingCallouts->getFfdcFiles() ||
+                    reportingCallouts->getFfdcFiles()->empty())
+                {
+                    throw std::runtime_error("Cannot prepare report-only callouts");
+                }
             }
 
-            // Get severity level (cast errl::Level enum to int)
-            auto level =
-                getSeverityLevel(static_cast<int>(entry->getSeverity()));
-
-            // Get service via D-Bus introspection
-            auto service = openpower::dump::util::getService(
-                bus, opLoggingInterface, loggingObjectPath);
-
-            // Prepare D-Bus call to CreatePELWithFFDCFiles (no files for hostfw
-            // errors)
-            auto method = bus.new_method_call(
-                service.c_str(), loggingObjectPath, opLoggingInterface,
-                "CreatePELWithFFDCFiles");
-
-            // Empty FFDC file list (tuple format: FFDCFormat enum, subtype,
-            // version, fd)
-            std::vector<std::tuple<DBusFFDCFormat, uint8_t, uint8_t,
-                                   sdbusplus::message::unix_fd>>
-                files;
-
-            // Append parameters: message, level, additionalData, files
-            method.append(entry->getMessage(), level, additionalData, files);
-
-            // Call D-Bus method and get response
+            OpenedFfdcFiles opened;
+            FfdcFiles files;
+            appendFfdcFiles(entry, files, opened, !terminal);
+            if (reportingCallouts)
+            {
+                appendFfdcFiles(*reportingCallouts, files, opened);
+            }
+            const auto service = openpower::dump::util::getService(bus, interface, path);
+            auto method = bus.new_method_call(service.c_str(), path, interface,
+                                              "CreatePELWithFFDCFiles");
+            method.append(entry.getMessage(),
+                          getSeverityLevel(static_cast<int>(entry.getSeverity())), data, files);
             auto reply = bus.call(method);
-            // Reply is a struct[uint32, uint32] containing (logId, pelId)
-            std::tuple<uint32_t, uint32_t> ids{0, 0};
+            std::tuple<uint32_t, uint32_t> ids{};
             reply.read(ids);
-            uint32_t logId = std::get<0>(ids);
-            pelId = std::get<1>(ids);
-
-            lg2::info("commitHostfwError: Created PEL from hostfw error, "
-                      "logId={LOG_ID}, pelId={PEL_ID}",
-                      "LOG_ID", logId, "PEL_ID", pelId);
-        }
-
-        return pelId;
-    }
-    catch (const std::exception& e)
-    {
-        lg2::error("commitHostfwError: Failed to create PEL: {EXCEPTION}",
-                   "EXCEPTION", e.what());
-        return 0;
-    }
+            return std::get<1>(ids);
+        },
+        [](const errl::ErrlEntry& entry, const char* detail) {
+            lg2::error("Failed to publish HostFW entry {ENTRY}: {ERROR}",
+                       "ENTRY", entry.getMessage(), "ERROR", detail);
+        });
 }
 #endif // NEXT_PHAL
 

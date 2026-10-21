@@ -14,6 +14,18 @@ if phal_backend == 'next'
     add_project_arguments('-DNEXT_PHAL', language: 'cpp')
     phal_deps += [dependency('hostfw_phal')]
     phal_src += files('chipop_next.cpp', 'error_next.cpp', 'targeting_next.cpp')
+    gtest_main_dep = dependency('gtest_main', required: false)
+    if gtest_main_dep.found()
+        test(
+            'phal-hostfw-publication',
+            executable(
+                'phal-hostfw-publication-test',
+                'tests/hostfw_error_publish_test.cpp',
+                dependencies: [gtest_main_dep, phal_deps],
+                include_directories: '.',
+            ),
+        )
+    endif
 elif phal_backend == 'legacy'
     add_project_arguments('-DLEGACY_PHAL', language: 'cpp')
     phal_deps += [

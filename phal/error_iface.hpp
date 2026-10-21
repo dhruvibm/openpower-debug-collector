@@ -64,13 +64,15 @@ std::tuple<uint32_t, std::string> getPelInfo(uint32_t logId);
 /**
  * @brief Commit a hostfw error handle as a PEL
  *
- * Takes an error handle returned by hostfw functions (e.g.,
- * recoverSppeAndCollectDump) and commits it as a PEL in the system.
- * Returns the PEL ID for tracking.
+ * Publishes every terminal and observation entry with its diagnostic data.
+ * A publication failure does not prevent later entries from being attempted
+ * or change the hardware operation's completion status. Observation callouts
+ * are report-only, with the original JSON retained in additional data.
+ * Terminal callout JSON and the existing severity mapping remain unchanged;
+ * this boundary invokes no local guard, deconfigure or dump actions.
  *
  * @param[in] err Error handle from hostfw (moved/consumed)
- * @return uint32_t PEL ID if committed successfully, 0 on failure or if err is
- * null
+ * @return Last successfully published PEL ID, or 0 when none was published.
  */
 uint32_t commitHostfwError(errl::ErrlHandleOpt&& err);
 #endif
