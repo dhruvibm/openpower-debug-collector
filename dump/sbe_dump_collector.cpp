@@ -169,10 +169,11 @@ void SbeDumpCollector::collectTriggeredSBEDump(
         // created (plat_dump directory) so opdreport can find and package them
         auto err =
             hostfw::dump::recoverSppeAndCollectDump(id, failingUnit, path);
-        if (err)
+        uint32_t pelId = 0;
+        if (phal_err::commitHostfwErrorAndCheckFailure(std::move(err), &pelId))
         {
-            // Commit the error as a PEL before throwing
-            uint32_t pelId = phal_err::commitHostfwError(std::move(err));
+            // Earlier dump files remain available even when a later operation
+            // failed. Publishing observations never turns collection terminal.
             lg2::error(
                 "collectTriggeredSBEDump: Timeout recovery failed for unit "
                 "{UNIT}, PEL ID: {PEL}",

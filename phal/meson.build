@@ -17,6 +17,16 @@ if phal_backend == 'next'
     gtest_main_dep = dependency('gtest_main', required: false)
     if gtest_main_dep.found()
         test(
+            'phal-dump-observations',
+            executable(
+                'phal-dump-observations-test',
+                'tests/dump_observation_test.cpp',
+                'chipop_next.cpp',
+                dependencies: [gtest_main_dep, phal_deps],
+                include_directories: '.',
+            ),
+        )
+        test(
             'phal-hostfw-publication',
             executable(
                 'phal-hostfw-publication-test',

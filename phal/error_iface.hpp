@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <string>
 #include <tuple>
+#include <utility>
 
 namespace openpower::dump::phal::error
 {
@@ -75,6 +76,25 @@ std::tuple<uint32_t, std::string> getPelInfo(uint32_t logId);
  * @return Last successfully published PEL ID, or 0 when none was published.
  */
 uint32_t commitHostfwError(errl::ErrlHandleOpt&& err);
+
+/**
+ * @brief Publish all diagnostics and return the HostFW terminal failure state.
+ *
+ * Collection payload and previously written files remain valid when the
+ * handle contains only observations. PEL publication does not change that
+ * operation outcome. An optional ID receives the last successfully created PEL.
+ */
+inline bool commitHostfwErrorAndCheckFailure(errl::ErrlHandleOpt&& err,
+                                             uint32_t* pelId = nullptr)
+{
+    const bool terminal = errl::hasTerminalErrors(err);
+    const auto id = commitHostfwError(std::move(err));
+    if (pelId)
+    {
+        *pelId = id;
+    }
+    return terminal;
+}
 #endif
 
 } // namespace openpower::dump::phal::error
