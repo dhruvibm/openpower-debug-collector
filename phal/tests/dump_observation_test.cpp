@@ -69,7 +69,7 @@ uint32_t commitHostfwError(errl::ErrlHandleOpt&& errors)
         return 0;
     return publishHostfwEntries(
         *errors,
-        [](const errl::ErrlEntry&, bool) -> uint32_t {
+        [](const errl::ErrlEntry&) -> uint32_t {
             ++publications;
             if (publicationUnavailable)
                 throw std::runtime_error("PEL unavailable");

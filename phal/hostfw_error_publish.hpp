@@ -9,38 +9,24 @@
 
 namespace openpower::dump::phal::error
 {
-/** Retain service callouts without automatic target actions for observations. */
-inline nlohmann::json reportOnlyCallouts(nlohmann::json callouts)
-{
-    for (auto& callout : callouts)
-    {
-        callout["Deconfigured"] = false;
-        callout["Guarded"] = false;
-        callout.erase("GuardType");
-    }
-    return callouts;
-}
-
 /**
  * @brief Publish every HostFW entry without changing the collection outcome.
  *
- * The publisher receives the entry's terminal classification independently of
- * its native severity. A failed publication is reported and later entries are
- * still attempted. The last successful PEL ID is retained for dump tracking.
+ * The publisher receives each entry with its native severity and requested
+ * callout actions. Observation classification does not suppress those actions.
+ * A failed publication is reported and later entries are still attempted. The
+ * last successful PEL ID is retained for dump tracking.
  */
 template <typename Publisher, typename FailureReporter>
 uint32_t publishHostfwEntries(const errl::ErrlHandle& errors,
                               Publisher&& publish, FailureReporter&& failed)
 {
     uint32_t lastPelId = 0;
-    const auto terminalCount = errors.getTerminalEntries().size();
-    size_t index = 0;
     for (const auto& entry : errors.getEntries())
     {
-        const bool terminal = index++ < terminalCount;
         try
         {
-            const auto id = publish(*entry, terminal);
+            const auto id = publish(*entry);
             if (id == 0)
             {
                 throw std::runtime_error("PEL service returned a zero PEL ID");

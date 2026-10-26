@@ -23,9 +23,9 @@ TEST(HostfwErrorPublishTest, AttemptsEveryEntryAfterPublicationFailure)
     int failures = 0;
     const auto pel = error::publishHostfwEntries(
         handle,
-        [&](const errl::ErrlEntry& entry, bool terminal) -> uint32_t {
+        [&](const errl::ErrlEntry& entry) -> uint32_t {
             attempts.push_back(entry.getMessage());
-            if (terminal)
+            if (entry.getMessage() == "terminal")
             {
                 EXPECT_EQ(entry.getSeverity(), errl::Level::Informational);
                 throw std::runtime_error("PEL unavailable");
@@ -54,9 +54,8 @@ TEST(HostfwErrorPublishTest, PreservesWireAttachmentBytesSubtypeAndVersion)
     int publications = 0;
     const auto pel = error::publishHostfwEntries(
         handle,
-        [&](const errl::ErrlEntry& entry, bool terminal) -> uint32_t {
+        [&](const errl::ErrlEntry& entry) -> uint32_t {
             ++publications;
-            EXPECT_FALSE(terminal);
             EXPECT_EQ(entry.getSeverity(), errl::Level::Error);
             EXPECT_TRUE(entry.getFfdcFiles());
             const auto& attachment = entry.getFfdcFiles()->front().first;
@@ -74,17 +73,44 @@ TEST(HostfwErrorPublishTest, PreservesWireAttachmentBytesSubtypeAndVersion)
     EXPECT_FALSE(handle.hasTerminalErrors());
 }
 
-TEST(HostfwErrorPublishTest, ObservationCalloutsRetainIdentityWithoutActions)
+TEST(HostfwErrorPublishTest, ErrorObservationRetainsCalloutActionsAndSuccess)
 {
     const nlohmann::json original = nlohmann::json::array(
         {{{"EntityPath", {1, 2, 3}}, {"Priority", "H"},
           {"Deconfigured", true}, {"Guarded", true}, {"GuardType", "FATAL"}}});
-    const auto report = error::reportOnlyCallouts(original);
-    EXPECT_EQ(report[0]["EntityPath"], original[0]["EntityPath"]);
-    EXPECT_EQ(report[0]["Priority"], "H");
-    EXPECT_EQ(report[0]["Deconfigured"], false);
-    EXPECT_EQ(report[0]["Guarded"], false);
-    EXPECT_FALSE(report[0].contains("GuardType"));
-    EXPECT_EQ(original[0]["Deconfigured"], true);
-    EXPECT_EQ(original[0]["Guarded"], true);
+    errl::ErrlHandle handle;
+    handle.addEntry(std::make_unique<errl::ErrlEntry>(
+                        "SBE observation", errl::Level::Error,
+                        std::unordered_map<std::string, std::string>{}, original),
+                    errl::ErrlHandle::EntryType::Observation);
+    int publications = 0;
+    const auto pel = error::publishHostfwEntries(
+        handle,
+        [&](const errl::ErrlEntry& entry) -> uint32_t {
+            ++publications;
+            EXPECT_EQ(entry.getSeverity(), errl::Level::Error);
+            EXPECT_TRUE(entry.getCallout());
+            if (!entry.getCallout())
+            {
+                return 0;
+            }
+            EXPECT_EQ(*entry.getCallout(), original);
+            EXPECT_TRUE(entry.getFfdcFiles());
+            if (!entry.getFfdcFiles() || entry.getFfdcFiles()->empty())
+            {
+                return 0;
+            }
+            const auto& attachment = entry.getFfdcFiles()->front().first;
+            EXPECT_EQ(attachment.format, errl::FFDCFormat::JSON);
+            EXPECT_EQ(attachment.subType, 0xCA);
+            std::string callouts(original.dump(2).size(), '\0');
+            EXPECT_EQ(pread(attachment.fd, callouts.data(), callouts.size(), 0),
+                      static_cast<ssize_t>(callouts.size()));
+            EXPECT_EQ(nlohmann::json::parse(callouts), original);
+            return 19;
+        },
+        [](const errl::ErrlEntry&, const char* message) { FAIL() << message; });
+    EXPECT_EQ(pel, 19U);
+    EXPECT_EQ(publications, 1);
+    EXPECT_FALSE(handle.hasTerminalErrors());
 }

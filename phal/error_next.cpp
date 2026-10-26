@@ -13,7 +13,6 @@
 
 #include <cstdlib>
 #include <map>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -101,17 +100,12 @@ using FfdcFiles = std::vector<std::tuple<
     DBusFFDCFormat, uint8_t, uint8_t, sdbusplus::message::unix_fd>>;
 
 void appendFfdcFiles(const errl::ErrlEntry& entry, FfdcFiles& files,
-                     OpenedFfdcFiles& opened, bool omitCallouts = false)
+                     OpenedFfdcFiles& opened)
 {
     if (const auto& attachments = entry.getFfdcFiles(); attachments)
     {
         for (const auto& [attachment, path] : *attachments)
         {
-            if (omitCallouts && attachment.format == errl::FFDCFormat::JSON &&
-                attachment.subType == 0xCA)
-            {
-                continue;
-            }
             int fd = attachment.fd;
             if (fd < 0)
             {
@@ -152,7 +146,7 @@ uint32_t commitHostfwError(errl::ErrlHandleOpt&& err)
     }
     return publishHostfwEntries(
         *err,
-        [](const errl::ErrlEntry& entry, bool terminal) {
+        [](const errl::ErrlEntry& entry) {
             auto bus = sdbusplus::bus::new_default();
             constexpr auto path = "/xyz/openbmc_project/logging";
             constexpr auto interface = "org.open_power.Logging.PEL";
@@ -160,31 +154,11 @@ uint32_t commitHostfwError(errl::ErrlHandleOpt&& err)
                 entry.getAdditionalData().begin(), entry.getAdditionalData().end());
             data["_PID"] = std::to_string(getpid());
 
-            // Terminal callouts retain their supplied policy. Observations
-            // preserve service information without introducing target actions.
-            std::unique_ptr<errl::ErrlEntry> reportingCallouts;
-            if (!terminal && entry.getCallout())
-            {
-                data["PHAL_CALLOUT_ACTIONS_SUPPRESSED"] = "true";
-                data["PHAL_ORIGINAL_CALLOUTS"] = entry.getCallout()->dump();
-                reportingCallouts = std::make_unique<errl::ErrlEntry>(
-                    entry.getMessage(), entry.getSeverity(),
-                    std::unordered_map<std::string, std::string>{},
-                    reportOnlyCallouts(*entry.getCallout()), std::nullopt);
-                if (!reportingCallouts->getFfdcFiles() ||
-                    reportingCallouts->getFfdcFiles()->empty())
-                {
-                    throw std::runtime_error("Cannot prepare report-only callouts");
-                }
-            }
-
+            // Observation classification changes the operation outcome only;
+            // retain the severity and requested callout actions for publication.
             OpenedFfdcFiles opened;
             FfdcFiles files;
-            appendFfdcFiles(entry, files, opened, !terminal);
-            if (reportingCallouts)
-            {
-                appendFfdcFiles(*reportingCallouts, files, opened);
-            }
+            appendFfdcFiles(entry, files, opened);
             const auto service = openpower::dump::util::getService(bus, interface, path);
             auto method = bus.new_method_call(service.c_str(), path, interface,
                                               "CreatePELWithFFDCFiles");

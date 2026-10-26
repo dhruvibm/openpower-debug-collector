@@ -67,10 +67,10 @@ std::tuple<uint32_t, std::string> getPelInfo(uint32_t logId);
  *
  * Publishes every terminal and observation entry with its diagnostic data.
  * A publication failure does not prevent later entries from being attempted
- * or change the hardware operation's completion status. Observation callouts
- * are report-only, with the original JSON retained in additional data.
- * Terminal callout JSON and the existing severity mapping remain unchanged;
- * this boundary invokes no local guard, deconfigure or dump actions.
+ * or change the hardware operation's completion status. Observation and
+ * terminal entries retain their supplied callout actions and native severity
+ * under the existing severity mapping. This boundary invokes no local guard,
+ * deconfigure or dump actions.
  *
  * @param[in] err Error handle from hostfw (moved/consumed)
  * @return Last successfully published PEL ID, or 0 when none was published.
