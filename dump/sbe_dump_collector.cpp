@@ -108,12 +108,9 @@ void SbeDumpCollector::collectHWHBDump(uint8_t type, uint32_t id,
     std::vector<uint8_t> clockStates = {SBE_CLOCK_ON, SBE_CLOCK_OFF};
     for (auto cstate : clockStates)
     {
-        // Skip collection for performance and hardware dumps if clock state is
-        // not ON Only hostboot dumps are collected with both clock states (ON
-        // and OFF)
-        if ((type == SBE_DUMP_TYPE_PERFORMANCE ||
-             type == SBE_DUMP_TYPE_HARDWARE) &&
-            cstate != SBE_CLOCK_ON)
+        // Hardware and Hostboot dumps collect both clock states. Performance
+        // dumps only collect with clocks on.
+        if (type == SBE_DUMP_TYPE_PERFORMANCE && cstate != SBE_CLOCK_ON)
         {
             continue;
         }
