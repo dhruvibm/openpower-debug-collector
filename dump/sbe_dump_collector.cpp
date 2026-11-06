@@ -166,10 +166,11 @@ void SbeDumpCollector::collectTriggeredSBEDump(
         // created (plat_dump directory) so opdreport can find and package them
         auto err =
             hostfw::dump::recoverSppeAndCollectDump(id, failingUnit, path);
-        if (err)
+        uint32_t pelId = 0;
+        if (phal_err::commitHostfwErrorAndCheckFailure(std::move(err), &pelId))
         {
-            // Commit the error as a PEL before throwing
-            uint32_t pelId = phal_err::commitHostfwError(std::move(err));
+            // Earlier dump files remain available even when a later operation
+            // failed. Publishing observations never turns collection terminal.
             lg2::error(
                 "collectTriggeredSBEDump: Timeout recovery failed for unit "
                 "{UNIT}, PEL ID: {PEL}",
@@ -216,13 +217,24 @@ void SbeDumpCollector::collectTriggeredSBEDump(
 
         if (err)
         {
-            // Commit whatever error was returned, whether it happened on the
-            // first getSBEDump call or after some files were already written.
-            uint32_t pelId = phal_err::commitHostfwError(std::move(err));
-            lg2::error(
-                "collectTriggeredSBEDump: Downstream collection error for "
-                "unit {UNIT}, PEL ID: {PEL}",
-                "UNIT", failingUnit, "PEL", pelId);
+            // Publish every diagnostic, including observations from successful
+            // chip-ops and errors returned after earlier files were written.
+            uint32_t pelId = 0;
+            if (phal_err::commitHostfwErrorAndCheckFailure(std::move(err),
+                                                           &pelId))
+            {
+                lg2::error(
+                    "collectTriggeredSBEDump: Downstream collection error for "
+                    "unit {UNIT}, PEL ID: {PEL}",
+                    "UNIT", failingUnit, "PEL", pelId);
+            }
+            else
+            {
+                lg2::info(
+                    "collectTriggeredSBEDump: Downstream collection observations "
+                    "for unit {UNIT}, PEL ID: {PEL}",
+                    "UNIT", failingUnit, "PEL", pelId);
+            }
 
             // Record the EID in the dump's errorInfo file so the dump
             // package carries a pointer to the error log. SRC is empty

@@ -143,6 +143,8 @@ struct ChipOpError : public std::exception
  * @param clockState Clock state (ON/OFF)
  * @param collectFastArray Whether to collect fast array data
  * @return DumpData containing collected dump
+ *         Next backend publishes observations while retaining successful data;
+ *         native diagnostic severity does not determine chip-op completion.
  * @throws ChipOpError on failure
  */
 DumpData getDump(targeting::TargetHandle chip, uint8_t dumpType,
