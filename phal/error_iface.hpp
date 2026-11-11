@@ -73,7 +73,9 @@ std::tuple<uint32_t, std::string> getPelInfo(uint32_t logId);
  * deconfigure or dump actions.
  *
  * @param[in] err Error handle from hostfw (moved/consumed)
- * @return Last successfully published PEL ID, or 0 when none was published.
+ * @return First successfully published PEL ID, or 0 when none was published.
+ *         Entries are ordered terminal-first, so a published terminal entry
+ *         takes precedence over observations.
  */
 uint32_t commitHostfwError(errl::ErrlHandleOpt&& err);
 
@@ -82,7 +84,8 @@ uint32_t commitHostfwError(errl::ErrlHandleOpt&& err);
  *
  * Collection payload and previously written files remain valid when the
  * handle contains only observations. PEL publication does not change that
- * operation outcome. An optional ID receives the last successfully created PEL.
+ * operation outcome. An optional ID receives the first successfully created
+ * PEL.
  */
 inline bool commitHostfwErrorAndCheckFailure(errl::ErrlHandleOpt&& err,
                                              uint32_t* pelId = nullptr)

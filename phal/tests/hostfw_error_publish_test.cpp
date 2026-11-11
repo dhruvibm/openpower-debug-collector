@@ -40,7 +40,7 @@ TEST(HostfwErrorPublishTest, AttemptsEveryEntryAfterPublicationFailure)
     EXPECT_TRUE(handle.hasTerminalErrors());
 }
 
-TEST(HostfwErrorPublishTest, LaterFailureRetainsLastSuccessfullyPublishedPel)
+TEST(HostfwErrorPublishTest, LaterFailureRetainsFirstSuccessfullyPublishedPel)
 {
     errl::ErrlHandle handle;
     for (const auto* message : {"first", "second", "failed"})
@@ -62,7 +62,7 @@ TEST(HostfwErrorPublishTest, LaterFailureRetainsLastSuccessfullyPublishedPel)
             return publications;
         },
         [&](const errl::ErrlEntry&, const char*) { ++failures; });
-    EXPECT_EQ(pel, 2U);
+    EXPECT_EQ(pel, 1U);
     EXPECT_EQ(publications, 3);
     EXPECT_EQ(failures, 1);
 }

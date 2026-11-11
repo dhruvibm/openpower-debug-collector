@@ -13,6 +13,7 @@
 
 #include <cerrno>
 #include <map>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -154,12 +155,15 @@ uint32_t commitHostfwError(errl::ErrlHandleOpt&& err)
     {
         return 0;
     }
+    constexpr auto path = "/xyz/openbmc_project/logging";
+    constexpr auto interface = "org.open_power.Logging.PEL";
+    // Created lazily so a D-Bus failure is reported per entry, and reused so
+    // the connection and service lookup happen once per handle.
+    std::optional<sdbusplus::bus_t> bus;
+    std::string service;
     return publishHostfwEntries(
         *err,
-        [](const errl::ErrlEntry& entry) {
-            auto bus = sdbusplus::bus::new_default();
-            constexpr auto path = "/xyz/openbmc_project/logging";
-            constexpr auto interface = "org.open_power.Logging.PEL";
+        [&](const errl::ErrlEntry& entry) {
             std::map<std::string, std::string> data(
                 entry.getAdditionalData().begin(),
                 entry.getAdditionalData().end());
@@ -171,13 +175,20 @@ uint32_t commitHostfwError(errl::ErrlHandleOpt&& err)
             OpenedFfdcFiles opened;
             FfdcFiles files;
             appendFfdcFiles(entry, files, opened);
-            const auto service =
-                openpower::dump::util::getService(bus, interface, path);
-            auto method = bus.new_method_call(service.c_str(), path, interface,
-                                              "CreatePELWithFFDCFiles");
+            if (!bus)
+            {
+                bus.emplace(sdbusplus::bus::new_default());
+            }
+            if (service.empty())
+            {
+                service =
+                    openpower::dump::util::getService(*bus, interface, path);
+            }
+            auto method = bus->new_method_call(service.c_str(), path, interface,
+                                               "CreatePELWithFFDCFiles");
             method.append(entry.getMessage(),
                           getSeverityLevel(entry.getSeverity()), data, files);
-            auto reply = bus.call(method);
+            auto reply = bus->call(method);
             std::tuple<uint32_t, uint32_t> ids{};
             reply.read(ids);
             const auto [logId, pelId] = ids;

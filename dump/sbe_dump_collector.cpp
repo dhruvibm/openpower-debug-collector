@@ -169,8 +169,9 @@ void SbeDumpCollector::collectTriggeredSBEDump(
         uint32_t pelId = 0;
         if (phal_err::commitHostfwErrorAndCheckFailure(std::move(err), &pelId))
         {
-            // Earlier dump files remain available even when a later operation
-            // failed. Publishing observations never turns collection terminal.
+            // Only terminal HostFW errors reach here; observations alone do
+            // not fail the recovery. Files written before the failure remain
+            // available.
             lg2::error(
                 "collectTriggeredSBEDump: Timeout recovery failed for unit "
                 "{UNIT}, PEL ID: {PEL}",
